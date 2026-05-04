@@ -1,0 +1,9 @@
+venv/*
+.log*
+Config/Setting.py
+Storage/*
+Documentacion/*
+Logs/*
+!Logs/.kitigt
+temp/*
+Config.example/*  
