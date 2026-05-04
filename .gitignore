@@ -1,4 +1,5 @@
 venv/*
+.env/*
 .log*
 Config/Setting.py
 Storage/*
