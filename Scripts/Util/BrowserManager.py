@@ -52,7 +52,24 @@ class BrowserManager:
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
                         "--disable-infobars",
-                        "--mute-audio"
+                        "--mute-audio",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-extensions",
+                        f"--js-flags=--max-old-space-size={self.limite_ram}",
+                        "--disk-cache-size=1",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-background-networking",
+                        "--disable-sync",
+                        "--disable-component-update",
+                        "--disable-default-apps",
+                        "--disable-notifications",
+                        "--disable-offer-store-unmasked-wallet-cards",
+                        "--disable-popup-blocking",
+                        "--disable-print-preview",
+                        "--disable-speech-api",
+                        "--password-store=basic"
                     ],
                     ignore_default_args=["--enable-automation"]
                 )
