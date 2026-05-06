@@ -1,5 +1,6 @@
 import os
 import sys
+import asyncio
 from dotenv import load_dotenv
 
 DIRECTORIO_ACTUAL = os.path.dirname(os.path.abspath(__file__))
@@ -19,22 +20,26 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 logger = setup_logger("WhatsApp-Browser", "whatsapp.log")
 
-def iniciar_servicio():
+async def iniciar_servicio():
     try:
-        puerto = os.getenv("PUERTO_WHATSAPP")
+        puerto = os.getenv("PUERTO_WHATSAPP", "9222")
         user_data = os.path.join(BASE_DIR, 'Storage', 'sesion_whatsapp')
         headless = os.getenv("MODO_HEADLESS", "False").lower() == "true"
-        browser = BrowserManager(
+        
+        manager = BrowserManager(
             user_data_dir=user_data,
             puerto=puerto,
             headless=headless
         )
 
-        logger.info("--- Iniciando Servicio Guardián de WhatsApp ---")
-        browser.lanzar_y_mantener("https://web.whatsapp.com")
+        logger.info("--- Iniciando Servicio Guardián de WhatsApp (Async) ---")
+        await manager.lanzar_y_mantener("https://web.whatsapp.com")
 
     except Exception as e:
         logger.error(f"Fallo crítico en el servicio: {e}")
 
 if __name__ == "__main__":
-    iniciar_servicio()
+    try:
+        asyncio.run(iniciar_servicio())
+    except KeyboardInterrupt:
+        logger.info("Servicio detenido por el usuario.")

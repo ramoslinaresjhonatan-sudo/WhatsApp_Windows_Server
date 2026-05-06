@@ -62,6 +62,7 @@ class MacroWhatsApp:
 
     def __init__(self):
         self.puerto    = os.getenv("PUERTO_WHATSAPP", "9222")
+        self.headless  = os.getenv("MODO_HEADLESS", "False").lower() == "true"
         self._playwright   = None
         self._browser      = None
         self._context      = None
@@ -312,52 +313,62 @@ class MacroWhatsApp:
 
     async def _enviar_archivos(self, rutas: list, caption: str = None):
         """
-        Adjunta uno o varios archivos al chat activo usando la estrategia de whatsplay.
+        Adjunta archivos usando la mejor estrategia según el modo (Clipboard vs Input).
         """
         rutas_validas = [os.path.abspath(r) for r in rutas if os.path.exists(r)]
-        ausentes = [r for r in rutas if not os.path.exists(r)]
-        if ausentes:
-            logger.warning(f"   [!] Archivos no encontrados: {ausentes}")
         if not rutas_validas:
             logger.error("   [✗] Ningún archivo válido para adjuntar.")
             return
 
-        logger.info(f"   Adjuntando {len(rutas_validas)} archivo(s): {[os.path.basename(r) for r in rutas_validas]}")
-        page  = self._page
-
-        try:
-            # 1. Abrir menú del clip
-            btn = page.locator(SEL_BTN_ADJUNTAR).first
-            await btn.wait_for(state="visible", timeout=5000)
-            await btn.click()
-            await asyncio.sleep(1.0)
-            
-            # 2. Buscar input de archivo
-            file_inputs = page.locator(SEL_FILE_INPUT)
-            total = await file_inputs.count()
-            
-            if total == 0:
-                logger.error("   [✗] No se encontró el input[type='file']")
+        page = self._page
+        
+        # ESTRATEGIA A: Portapapeles (Solo en modo VISIBLE)
+        if not self.headless:
+            try:
+                logger.info(f"   Adjuntando {len(rutas_validas)} archivo(s) vía portapapeles (Modo Visible)...")
+                await self._pegar_archivos_portapapeles(rutas_validas, page)
+                await asyncio.sleep(4)
+                if caption: await self._escribir_caption(caption, page)
+                await self._click_enviar()
                 return
+            except Exception as e:
+                logger.warning(f"   [!] Falló portapapeles: {e}. Intentando método de input...")
+
+        # ESTRATEGIA B: Carga Directa (File Chooser Profesional)
+        try:
+            logger.info(f"   [MODO OCULTO] Usando interceptor de archivos (File Chooser)...")
             
-            # 3. Adjuntar usando el primer input disponible
-            logger.info(f"   [+] {total} input(s) encontrados. Cargando archivos...")
-            await file_inputs.first.set_input_files(rutas_validas)
+            # 1. Preparar la escucha del selector de archivos
+            async with page.expect_file_chooser() as fc_info:
+                # 2. Abrir menú y clicar en Documento para disparar el selector
+                try:
+                    await page.locator(SEL_BTN_ADJUNTAR).first.click(timeout=3000)
+                    await asyncio.sleep(0.5)
+                    
+                    # Intentamos clicar en el icono de documento
+                    doc_btn = page.locator('span[data-icon="attach-document"], [aria-label="Documento"]').first
+                    await doc_btn.click(timeout=2000)
+                except Exception as e:
+                    logger.warning(f"      [!] No se pudo disparar el menú: {e}")
+                    # Fallback: intentar clicar en cualquier input para forzarlo
+                    await page.locator('input[type="file"]').first.click()
+
+            # 3. Entregar los archivos al selector interceptado
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(rutas_validas)
             
-            # Esperar a que WhatsApp procese la vista previa del adjunto
-            logger.info("   Esperando vista previa del adjunto...")
-            await asyncio.sleep(5)
+            logger.info("   [✓] Archivos entregados a WhatsApp. Esperando vista previa...")
+            await asyncio.sleep(7) 
             
             if caption:
                 await self._escribir_caption(caption, page)
 
-            # Enviar el adjunto
+            # 4. Enviar
             await self._click_enviar()
-            await asyncio.sleep(2.0)
-            logger.info("   [✓] Archivos procesados y enviados.")
+            logger.info("   [✓] Envío completado.")
 
         except Exception as e:
-            logger.error(f"   [✗] Error al adjuntar archivo: {e}")
+            logger.error(f"   [✗] Error crítico al adjuntar: {e}")
             try: await page.keyboard.press("Escape")
             except: pass
 
