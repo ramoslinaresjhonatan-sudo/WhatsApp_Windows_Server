@@ -9,32 +9,10 @@ logger = logging.getLogger("BrowserManager")
 
 class BrowserManager:
 
-    def __init__(self, user_data_dir, puerto="9222", headless=False, limite_ram_mb=400):
+    def __init__(self, user_data_dir, puerto="9222", headless=False):
         self.user_data_dir = user_data_dir
         self.puerto = puerto
         self.headless = headless
-        self.limite_ram = limite_ram_mb
-
-    def reducir_memoria(self):
-        pids_validos = set()
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            if 'msedge' in proc.info['name'].lower():
-                try:
-                    cmdline = proc.info.get('cmdline') or []
-                    if any(f"--remote-debugging-port={self.puerto}" in arg for arg in cmdline):
-                        pids_validos.add(proc.info['pid'])
-                        p = psutil.Process(proc.info['pid'])
-                        for child in p.children(recursive=True):
-                            pids_validos.add(child.pid)
-                except: continue
-        
-        for pid in pids_validos:
-            try:
-                handle = ctypes.windll.kernel32.OpenProcess(0x001F0FFF, False, pid)
-                if handle:
-                    ctypes.windll.psapi.EmptyWorkingSet(handle)
-                    ctypes.windll.kernel32.CloseHandle(handle)
-            except: pass
 
     def lanzar_y_mantener(self, urls=["https://web.whatsapp.com"]):
         if isinstance(urls, str):
@@ -47,17 +25,16 @@ class BrowserManager:
                     user_data_dir=self.user_data_dir,
                     channel="msedge",
                     headless=self.headless,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+                    no_viewport=True,
                     args=[
                         f"--remote-debugging-port={self.puerto}",
                         "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
                         "--disable-infobars",
+                        "--start-maximized",
                         "--mute-audio",
                         "--disable-dev-shm-usage",
-                        "--disable-gpu",
                         "--disable-extensions",
-                        f"--js-flags=--max-old-space-size={self.limite_ram}",
-                        "--disk-cache-size=1",
                         "--no-first-run",
                         "--no-default-browser-check",
                         "--disable-background-networking",
@@ -84,11 +61,35 @@ class BrowserManager:
                         page = context.new_page()
                     
                     logger.info(f"Abriendo pestaña {i+1}: {url}")
-                    page.goto(url)
+                    
+                    page.goto(url, wait_until="domcontentloaded")
                 
+                logger.info("Monitoreando estado del navegador (Control de Popups)...")
                 while True:
-                    self.reducir_memoria()
-                    time.sleep(120)
+                    # Control de popups de sesión y limpieza de duplicados
+                    try:
+                        all_pages = context.pages
+                        whatsapp_pages = [p for p in all_pages if "whatsapp.com" in p.url]
+                        
+                        # Si hay más de una pestaña de WhatsApp abierta, cerramos las extras para evitar conflictos
+                        if len(whatsapp_pages) > 1:
+                            for extra_page in whatsapp_pages[1:]:
+                                try: extra_page.close()
+                                except: pass
+                        
+                        # En la pestaña principal de WhatsApp, buscamos el botón de "Usar aquí"
+                        if whatsapp_pages:
+                            p = whatsapp_pages[0]
+                            usar_aqui = p.get_by_role("button", name="Usar aquí")
+                            if usar_aqui.is_visible(timeout=500):
+                                logger.warning("⚠️ Sesión detectada en otra ventana. Reclamando sesión...")
+                                usar_aqui.click()
+                                logger.info("✅ Sesión reclamada con éxito.")
+                                time.sleep(5) # Esperamos a que la sesión se estabilice
+                    except Exception:
+                        pass # Si una pestaña se cierra durante el proceso, ignoramos
+                            
+                    time.sleep(5) 
                     
             except Exception as e:
                 logger.error(f"Error en el ciclo del navegador: {e}")

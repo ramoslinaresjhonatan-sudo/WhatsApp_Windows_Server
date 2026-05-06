@@ -23,13 +23,11 @@ def iniciar_servicio():
     try:
         puerto = os.getenv("PUERTO_WHATSAPP")
         user_data = os.path.join(BASE_DIR, 'Storage', 'sesion_whatsapp')
-        limite_ram = int(os.getenv("LIMITE_RAM_MB", "400"))
         headless = os.getenv("MODO_HEADLESS", "False").lower() == "true"
         browser = BrowserManager(
             user_data_dir=user_data,
             puerto=puerto,
-            headless=headless,
-            limite_ram_mb=limite_ram
+            headless=headless
         )
 
         logger.info("--- Iniciando Servicio Guardián de WhatsApp ---")
