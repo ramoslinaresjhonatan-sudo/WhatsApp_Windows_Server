@@ -63,6 +63,7 @@ class MacroWhatsApp:
     def __init__(self):
         self.puerto    = os.getenv("PUERTO_WHATSAPP", "9222")
         self.headless  = os.getenv("MODO_HEADLESS", "False").lower() == "true"
+        self.limite_ram = int(os.getenv("LIMITE_RAM_MB", "1024"))
         self._playwright   = None
         self._browser      = None
         self._context      = None
@@ -169,8 +170,17 @@ class MacroWhatsApp:
                     await asyncio.sleep(1.5)
 
                 if archivos:
-                    # Enviamos los archivos después
-                    await self._enviar_archivos(archivos)
+                    # Normalizar y detectar si son imágenes
+                    logger.info(f"   [Envío] Procesando adjuntos: {archivos}")
+                    extensiones_img = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
+                    es_imagen = any(str(r).lower().strip().endswith(extensiones_img) for r in archivos)
+                    
+                    if es_imagen:
+                        logger.info("   [Envío] Resultado: IMAGEN detectada. Usando canal multimedia.")
+                        await self._enviar_multimedia(archivos, caption=None)
+                    else:
+                        logger.info("   [Envío] Resultado: DOCUMENTO detectado. Usando canal de archivos.")
+                        await self._enviar_archivos(archivos)
 
                 # Verificar que el mensaje se envió
                 if await self._verificar_envio():
@@ -190,6 +200,24 @@ class MacroWhatsApp:
         logger.error(f"Falló el envío a '{chat}' tras {self.MAX_REINTENTOS} intentos.")
         self._tareas_activas -= 1
         return False
+
+    async def verificar_y_limpiar_ram(self):
+        """Método requerido por el monitor de la API para gestionar la memoria."""
+        try:
+            import psutil
+            import os
+            
+            # Obtener proceso actual
+            proceso = psutil.Process(os.getpid())
+            mem_actual = proceso.memory_info().rss / (1024 * 1024) # MB
+            
+            if mem_actual > self.limite_ram:
+                logger.warning(f"   [!] RAM elevada ({mem_actual:.2f}MB > {self.limite_ram}MB). Limpiando...")
+                await self._limpiar_conexion()
+            else:
+                logger.debug(f"   [Monitor] RAM estable: {mem_actual:.2f}MB")
+        except Exception as e:
+            logger.error(f"   [!] Error en monitor de RAM: {e}")
 
     async def mensaje(self, chat: str, texto: str) -> bool:
         return await self.enviar(chat, mensaje=texto)
@@ -252,20 +280,32 @@ class MacroWhatsApp:
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
         await asyncio.sleep(0.2)
-        await page.keyboard.type(nombre, delay=50)
-        await asyncio.sleep(1.8)
+        await page.keyboard.type(nombre, delay=80)
+        await asyncio.sleep(2.5) # Tiempo para que carguen los resultados
 
-        # Intentar hacer clic en el resultado de búsqueda
-        try:
-            contact = page.locator(f'span[title="{nombre}"]').first
-            await contact.wait_for(state="visible", timeout=6000)
-            await contact.click()
-        except:
-            # Fallback: presionar Enter
+        # Intentar hacer clic en el resultado (Varios selectores posibles)
+        selectors = [
+            f'span[title="{nombre}"]',
+            f'div[data-testid="list-item"] span[title="{nombre}"]',
+            f'div[role="listitem"] span[title="{nombre}"]'
+        ]
+        
+        found = False
+        for sel in selectors:
+            try:
+                contact = page.locator(sel).first
+                if await contact.is_visible(timeout=1000):
+                    await contact.click()
+                    found = True
+                    break
+            except: continue
+
+        if not found:
+            logger.warning(f"   [!] No se pudo clicar en '{nombre}', forzando con Enter...")
             await page.keyboard.press("Enter")
 
-        await asyncio.sleep(1.2)
-        await self._esperar_chat_abierto(nombre)
+        await asyncio.sleep(1.5)
+        return await self._esperar_chat_abierto(nombre)
 
     async def _esperar_chat_abierto(self, nombre: str) -> bool:
         """Verifica que el header del chat muestre el nombre correcto."""
@@ -444,6 +484,44 @@ class MacroWhatsApp:
     # VERIFICACIÓN Y UTILIDADES
     # ─────────────────────────────────────────
 
+    async def enviar_captura(self, chat: str, html: str, caption: str = None, engine: str = "marco") -> bool:
+        """
+        Genera una imagen desde HTML, BUSCA EL CHAT, la envía y luego la elimina.
+        """
+        if engine == "marco":
+            from Scripts.Util.PictureMarco import picture as EngineClass
+        else:
+            from Scripts.Util.Picture import Picture as EngineClass
+        
+        from Scripts.Util.Storage import Storage
+        
+        p = EngineClass()
+        s = Storage("imagenes")
+        
+        try:
+            # 1. Asegurar conexión y buscar el chat
+            if not await self.conectar():
+                return False
+            
+            if not await self._buscar_chat(chat):
+                logger.error(f"   [✗] No se pudo encontrar el chat para la captura: {chat}")
+                return False
+
+            # 2. Generar la imagen
+            logger.info(f"   [Captura] Generando imagen ({engine}) para {chat}...")
+            ruta_imagen = await p.crear_imagen(html)
+            
+            # 3. Enviar usando el canal de MULTIMEDIA (visible)
+            exito = await self._enviar_multimedia([ruta_imagen], caption)
+            
+            if exito:
+                s.borrar_archivo(ruta_imagen)
+            
+            return exito
+        except Exception as e:
+            logger.error(f"   [✗] Error en proceso de captura: {e}")
+            return False
+
     async def _verificar_envio(self) -> bool:
         """
         Espera a que desaparezca el icono de 'pendiente' y aparezca
@@ -460,6 +538,67 @@ class MacroWhatsApp:
             # Si el timeout vence, lo consideramos enviado de todas formas
             # (WhatsApp puede no mostrar el tick si hay lag)
             return True
+
+    async def _enviar_multimedia(self, rutas: list, caption: str = None) -> bool:
+        """
+        Envía archivos usando el canal de 'Fotos y Videos' (o Pegar) para que sean visibles como imágenes.
+        """
+        page = self._page
+        rutas_validas = [os.path.abspath(r) for r in rutas if os.path.exists(r)]
+        if not rutas_validas:
+            logger.error("   [✗] No hay rutas válidas para enviar multimedia.")
+            return False
+        
+        try:
+            # ESTRATEGIA A: Portapapeles (Solo en modo VISIBLE)
+            # El pegado directo suele forzar a WhatsApp a tratarlo como imagen/video con vista previa
+            if not self.headless:
+                try:
+                    logger.info(f"   [Multimedia] Pegando {len(rutas_validas)} imagen(es) vía portapapeles...")
+                    await self._pegar_archivos_portapapeles(rutas_validas, page)
+                    
+                    # Esperar a que cargue la vista previa
+                    logger.info("   [Multimedia] Esperando procesamiento de vista previa...")
+                    await asyncio.sleep(5) 
+                    
+                    if caption: 
+                        await self._escribir_caption(caption, page)
+                        await asyncio.sleep(0.5)
+                    
+                    await self._click_enviar()
+                    return True
+                except Exception as e:
+                    logger.warning(f"   [!] Falló pegado en multimedia: {e}. Intentando método de selector...")
+
+            # ESTRATEGIA B: Método de selector (Fotos y Videos)
+            logger.info("   [Multimedia] Usando selector de 'Fotos y videos'...")
+            async with page.expect_file_chooser() as fc_info:
+                # 1. Clic en el clip/plus
+                await page.locator(SEL_BTN_ADJUNTAR).first.click(timeout=3000)
+                await asyncio.sleep(0.5)
+                
+                # 2. Clic en "Fotos y videos"
+                btn_fotos = page.locator('span[data-icon="attach-image"], [aria-label="Fotos y videos"]').first
+                await btn_fotos.click()
+            
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(rutas_validas)
+            
+            # 3. Esperar procesamiento
+            logger.info("   [Multimedia] Esperando a que la imagen esté lista...")
+            await asyncio.sleep(5)
+            
+            if caption: 
+                await self._escribir_caption(caption, page)
+                await asyncio.sleep(0.5)
+
+            # 4. Enviar
+            await self._click_enviar()
+            return True
+
+        except Exception as e:
+            logger.error(f"   [✗] Error al enviar multimedia: {e}")
+            return False
 
     async def cerrar(self):
         """Cierra la conexión Playwright sin cerrar el navegador."""

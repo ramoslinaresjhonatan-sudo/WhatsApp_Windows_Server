@@ -27,7 +27,7 @@ mensaje_queue = asyncio.Queue()
 async def monitorear_memoria_background():
     while True:
         try:
-            await ws.verificar_y_limpiar_memoria()
+            await ws.verificar_y_limpiar_ram()
         except Exception as e:
             logger.error(f"Error en monitor de memoria: {e}")
         await asyncio.sleep(120)
@@ -39,7 +39,10 @@ async def procesador_de_cola():
         try:
             logger.info(f"Procesando mensaje en cola para: {chat}")
             
-            if archivos:
+            if isinstance(archivos, dict) and archivos.get("tipo") == "captura_html":
+                # Nueva lógica para capturar HTML y enviar
+                resultado = await ws.enviar_captura(chat, mensaje)
+            elif archivos:
                 resultado = await ws.varios(chat, archivos, mensaje)
             else:
                 resultado = await ws.mensaje(chat, mensaje)
@@ -96,8 +99,25 @@ async def api_enviar_mensaje(req: MessageRequest, request: Request):
         logger.error(f"Error procesando envío encolado: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/sistema", dependencies=[Depends(security.verificar)])
-async def api_sistema():
+@app.post("/enviar-captura", dependencies=[Depends(security.verificar)])
+async def api_enviar_captura(req: MessageRequest, request: Request):
+    """
+    Nuevo endpoint: Recibe HTML en el campo 'mensaje' y lo envía como imagen.
+    """
+    logger.info(f"Petición de CAPTURA recibida de {request.client.host} para '{req.chat}'")
+    
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    
+    # Usamos un marcador especial en la cola para identificar que es una captura
+    await mensaje_queue.put((req.chat, req.mensaje, {"tipo": "captura_html"}, future))
+    
+    try:
+        resultado = await asyncio.wait_for(future, timeout=300)
+        if resultado: return {"status": "success", "info": "HTML enviado como imagen"}
+        raise HTTPException(status_code=500, detail="Error al procesar captura HTML")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     import psutil
     
     api_proc = psutil.Process(os.getpid())
