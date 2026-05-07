@@ -13,18 +13,14 @@ class picture:
     def __init__(self):
         os.makedirs(STORAGE_DIR, exist_ok=True)
 
-    async def crear_imagen(self, html: str, nombre_base: str = "ticket"):
-        """
-        Renderiza HTML y devuelve la ruta de la imagen.
-        """
+    async def create_image(self, html: str, base_name: str = "ticket"):
         import time
-        filename = f"{nombre_base}_{int(time.time())}.png"
+        filename = f"{base_name}_{int(time.time())}.png"
         output_path = os.path.join(STORAGE_DIR, filename)
         
-        logger.info(f"   [PictureMarco] Renderizando HTML a {filename}...")
+        logger.info(f"   [PictureMarco] Rendering HTML to {filename}...")
         
         async with async_playwright() as p:
-            # Usamos headless=True para que no abra ventanas físicas
             browser = await p.chromium.launch(headless=True)
             try:
                 context = await browser.new_context(
@@ -33,20 +29,16 @@ class picture:
                 )
                 page = await context.new_page()
                 
-                # Cargamos el contenido
                 await page.set_content(html)
-                
-                # Esperamos a que los recursos carguen
                 await page.wait_for_load_state("networkidle", timeout=10000)
                 
-                # Capturamos el body
                 element = page.locator("body")
                 await element.screenshot(path=output_path)
                 
-                logger.info(f"   [PictureMarco] Imagen creada: {output_path}")
+                logger.info(f"   [PictureMarco] Image created: {output_path}")
                 return output_path
             except Exception as e:
-                logger.error(f"   [PictureMarco] Error renderizando: {e}")
+                logger.error(f"   [PictureMarco] Rendering error: {e}")
                 raise e
             finally:
                 await browser.close()

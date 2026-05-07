@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 from logging.handlers import TimedRotatingFileHandler
 
 class DailyRotatingFileHandler(TimedRotatingFileHandler):
@@ -29,6 +29,14 @@ class DailyRotatingFileHandler(TimedRotatingFileHandler):
             result = result[:len(result) - self.backupCount]
         return result
 
+class ColorFormatter(logging.Formatter):
+    def format(self, record):
+        timestamp = self.formatTime(record, self.datefmt)
+        level = record.levelname.ljust(8)
+        name = record.name.ljust(15)
+        message = record.getMessage()
+        return f"{timestamp} | {level} | {name} | {message}"
+
 def setup_logger(name: str, log_file: str, level=logging.INFO):
     if not os.path.isabs(log_file):
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,20 +45,19 @@ def setup_logger(name: str, log_file: str, level=logging.INFO):
     log_dir = os.path.dirname(log_file)
     os.makedirs(log_dir, exist_ok=True)
 
-    handler = DailyRotatingFileHandler(
-        log_file,
-        when="midnight",
-        interval=1,
-        backupCount=30,
-        encoding='utf-8'
-    )
-
-    formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)-8s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = ColorFormatter(datefmt='%Y-%m-%d %H:%M:%S')
+    
+    handler = DailyRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=30)
     handler.setFormatter(formatter)
 
-    logging.basicConfig(
-        level=level,
-        handlers=[handler, logging.StreamHandler()]
-    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
+    if not logger.handlers:
+        logger.addHandler(handler)
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
-    return logging.getLogger(name)
+    return logger

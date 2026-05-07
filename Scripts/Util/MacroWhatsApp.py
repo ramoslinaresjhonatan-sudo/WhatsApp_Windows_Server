@@ -12,9 +12,6 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 logger = logging.getLogger("WhatsApp")
 
-# ──────────────────────────────────────────────────────────
-# SELECTORES DE WHATSAPP WEB (actualizables sin tocar lógica)
-# ──────────────────────────────────────────────────────────
 SEL_SIDEBAR       = '#side'
 SEL_MAIN          = '#main'
 SEL_LOADING       = 'div[data-testid="loading"]'
@@ -50,32 +47,22 @@ SEL_CAPTION = [
     'div[data-tab="6"]',
 ]
 
-
 class MacroWhatsApp:
-    """
-    Motor de automatización de WhatsApp Web.
-    Maneja conexión, envío de texto, archivos adjuntos y limpieza de memoria.
-    """
 
-    MAX_REINTENTOS = 3
-    DELAY_REINTENTO = 2.0
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2.0
 
     def __init__(self):
-        self.puerto    = os.getenv("PUERTO_WHATSAPP", "9222")
+        self.port      = os.getenv("PUERTO_WHATSAPP", "9222")
         self.headless  = os.getenv("MODO_HEADLESS", "False").lower() == "true"
-        self.limite_ram = int(os.getenv("LIMITE_RAM_MB", "1024"))
+        self.ram_limit = int(os.getenv("LIMITE_RAM_MB", "1024"))
         self._playwright   = None
         self._browser      = None
         self._context      = None
         self._page         = None
-        self._tareas_activas = 0
+        self._active_tasks = 0
 
-    # ─────────────────────────────────────────
-    # CONEXIÓN
-    # ─────────────────────────────────────────
-
-    async def conectar(self) -> bool:
-        """Conecta al navegador Edge via CDP. Reconecta si la página está cerrada."""
+    async def connect(self) -> bool:
         if self._page and not self._page.is_closed():
             return True
         try:
@@ -83,15 +70,14 @@ class MacroWhatsApp:
                 self._playwright = await async_playwright().start()
 
             self._browser = await self._playwright.chromium.connect_over_cdp(
-                f"http://localhost:{self.puerto}"
+                f"http://localhost:{self.port}"
             )
             if not self._browser.contexts:
-                logger.error("No hay contextos en el navegador. ¿Está corriendo VentaDeWhatsapp?")
+                logger.error("No contexts found in browser. Is VentaDeWhatsapp running?")
                 return False
 
             self._context = self._browser.contexts[0]
 
-            # Buscar página de WhatsApp Web entre las pestañas abiertas
             self._page = None
             for p in self._context.pages:
                 if "whatsapp.com" in p.url:
@@ -102,36 +88,31 @@ class MacroWhatsApp:
                 self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
             await self._page.bring_to_front()
-            return await self._validar_whatsapp()
+            return await self._validate_whatsapp()
 
         except Exception as e:
-            logger.error(f"Error al conectar con el navegador: {e}")
-            await self._limpiar_conexion()
+            logger.error(f"Error connecting to browser: {e}")
+            await self._clean_connection()
             return False
 
-    async def _validar_whatsapp(self) -> bool:
-        """Verifica que WhatsApp Web esté cargado y listo."""
+    async def _validate_whatsapp(self) -> bool:
         try:
             await self._page.wait_for_selector(SEL_SIDEBAR, timeout=5000)
-            logger.debug("WhatsApp Web validado correctamente.")
             return True
         except:
-            logger.warning("WhatsApp no está en la pantalla principal. Intentando navegar...")
-            return await self._abrir_whatsapp()
+            return await self._open_whatsapp()
 
-    async def _abrir_whatsapp(self) -> bool:
-        """Navega a WhatsApp Web si no está cargado."""
+    async def _open_whatsapp(self) -> bool:
         try:
             if "whatsapp.com" not in self._page.url:
                 await self._page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
             await self._page.wait_for_selector(SEL_SIDEBAR, timeout=60000)
             return True
         except Exception as e:
-            logger.error(f"No se pudo cargar WhatsApp Web: {e}")
+            logger.error(f"Could not load WhatsApp Web: {e}")
             return False
 
-    async def _limpiar_conexion(self):
-        """Limpia el estado de la conexión para un reintento limpio."""
+    async def _clean_connection(self):
         try:
             if self._playwright:
                 await self._playwright.stop()
@@ -141,112 +122,99 @@ class MacroWhatsApp:
             self._browser   = None
             self._playwright = None
 
-    # ─────────────────────────────────────────
-    # API PÚBLICA
-    # ─────────────────────────────────────────
+    async def send(self, chat: str, message: str = None, files: list = None) -> bool:
+        self._active_tasks += 1
+        attempt = 0
 
-    async def enviar(self, chat: str, mensaje: str = None, archivos: list = None) -> bool:
-        """
-        Envía un mensaje de texto, archivo(s) o ambos a un chat de WhatsApp.
-        Si hay archivos, el mensaje de texto va como leyenda (caption) del adjunto.
-        Reintentos automáticos en caso de error.
-        """
-        self._tareas_activas += 1
-        intento = 0
-
-        while intento < self.MAX_REINTENTOS:
-            intento += 1
-            logger.info(f"Intento {intento}/{self.MAX_REINTENTOS} — Enviando a '{chat}'...")
+        while attempt < self.MAX_RETRIES:
+            attempt += 1
+            logger.info(f"Attempt {attempt}/{self.MAX_RETRIES} - Sending to '{chat}'...")
 
             try:
-                if not await self.conectar():
-                    raise ConnectionError("No se pudo conectar al navegador.")
+                if not await self.connect():
+                    raise ConnectionError("Could not connect to browser.")
 
-                await self._buscar_chat(chat)
+                await self._search_chat(chat)
 
-                if mensaje:
-                    # Enviamos el mensaje de texto primero como mensaje independiente
-                    await self._enviar_texto(mensaje)
+                if message:
+                    await self._send_text(message)
                     await asyncio.sleep(1.5)
 
-                if archivos:
-                    # Normalizar y detectar si son imágenes
-                    logger.info(f"   [Envío] Procesando adjuntos: {archivos}")
-                    extensiones_img = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
-                    es_imagen = any(str(r).lower().strip().endswith(extensiones_img) for r in archivos)
+                if files:
+                    logger.info(f"   [Send] Processing attachments: {files}")
+                    img_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
+                    is_image = any(str(f).lower().strip().endswith(img_extensions) for f in files)
                     
-                    if es_imagen:
-                        logger.info("   [Envío] Resultado: IMAGEN detectada. Usando canal multimedia.")
-                        await self._enviar_multimedia(archivos, caption=None)
+                    if is_image:
+                        logger.info("   [Send] Image detected. Using multimedia channel.")
+                        await self._send_multimedia(files, caption=None)
                     else:
-                        logger.info("   [Envío] Resultado: DOCUMENTO detectado. Usando canal de archivos.")
-                        await self._enviar_archivos(archivos)
+                        logger.info("   [Send] Document detected. Using file channel.")
+                        await self._send_files(files)
 
-                # Verificar que el mensaje se envió
-                if await self._verificar_envio():
-                    logger.info(f"   [✓] Confirmado: mensaje enviado a '{chat}'.")
+                if await self._verify_send():
+                    logger.info(f"   [OK] Confirmed: message sent to '{chat}'.")
                     return True
                 else:
-                    logger.warning(f"   [!] No se pudo confirmar el envío (intento {intento}).")
+                    logger.warning(f"   [!] Could not confirm send (attempt {attempt}).")
 
             except Exception as e:
-                logger.error(f"   Error en intento {intento}: {e}")
-                # Forzar reconexión en el siguiente intento
-                await self._limpiar_conexion()
+                logger.error(f"   Error in attempt {attempt}: {e}")
+                await self._clean_connection()
 
-            if intento < self.MAX_REINTENTOS:
-                await asyncio.sleep(self.DELAY_REINTENTO)
+            if attempt < self.MAX_RETRIES:
+                await asyncio.sleep(self.RETRY_DELAY)
 
-        logger.error(f"Falló el envío a '{chat}' tras {self.MAX_REINTENTOS} intentos.")
-        self._tareas_activas -= 1
+        logger.error(f"Failed to send to '{chat}' after {self.MAX_RETRIES} attempts.")
+        self._active_tasks -= 1
         return False
 
-    async def verificar_y_limpiar_ram(self):
-        """Método requerido por el monitor de la API para gestionar la memoria."""
+    async def check_and_clean_ram(self):
         try:
-            import psutil
-            import os
+            api_proc = psutil.Process(os.getpid())
+            total_ram = api_proc.memory_info().rss / (1024 * 1024)
             
-            # Obtener proceso actual
-            proceso = psutil.Process(os.getpid())
-            mem_actual = proceso.memory_info().rss / (1024 * 1024) # MB
+            edge_pids = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if 'msedge' in proc.info['name'].lower():
+                    cmd = str(proc.info.get('cmdline') or "")
+                    if f"--remote-debugging-port={self.port}" in cmd:
+                        edge_pids.append(proc.info['pid'])
             
-            if mem_actual > self.limite_ram:
-                logger.warning(f"   [!] RAM elevada ({mem_actual:.2f}MB > {self.limite_ram}MB). Limpiando...")
-                await self._limpiar_conexion()
-            else:
-                logger.debug(f"   [Monitor] RAM estable: {mem_actual:.2f}MB")
+            for pid in edge_pids:
+                try:
+                    p = psutil.Process(pid)
+                    total_ram += p.memory_info().rss / (1024 * 1024)
+                    for child in p.children(recursive=True):
+                        total_ram += child.memory_info().rss / (1024 * 1024)
+                except: continue
+
+            if total_ram > self.ram_limit:
+                logger.info(f"RAM cleanup needed ({total_ram:.0f}MB > {self.ram_limit}MB). Restarting browser...")
+                await self._clean_connection()
         except Exception as e:
-            logger.error(f"   [!] Error en monitor de RAM: {e}")
+            pass
 
-    async def mensaje(self, chat: str, texto: str) -> bool:
-        return await self.enviar(chat, mensaje=texto)
+    async def message(self, chat: str, text: str) -> bool:
+        return await self.send(chat, message=text)
 
-    async def archivo(self, chat: str, ruta: str, texto: str = "") -> bool:
-        return await self.enviar(chat, mensaje=texto or None, archivos=[ruta])
+    async def file(self, chat: str, path: str, text: str = "") -> bool:
+        return await self.send(chat, message=text or None, files=[path])
 
-    async def varios(self, chat: str, rutas: list, texto: str = "") -> bool:
-        return await self.enviar(chat, mensaje=texto or None, archivos=rutas)
+    async def multiple(self, chat: str, paths: list, text: str = "") -> bool:
+        return await self.send(chat, message=text or None, files=paths)
 
-    # ─────────────────────────────────────────
-    # BÚSQUEDA DE CHAT
-    # ─────────────────────────────────────────
-
-    async def _buscar_chat(self, nombre: str):
-        """Busca y abre el chat. Espera a que WhatsApp esté listo antes de buscar."""
+    async def _search_chat(self, name: str):
         page = self._page
 
-        # Esperar que la interfaz esté completamente cargada
         try:
             await page.wait_for_selector(SEL_SIDEBAR, timeout=30000)
             await page.wait_for_selector(SEL_LOADING, state="hidden", timeout=10000)
         except: pass
 
-        # Hacer clic en el panel lateral para asegurar el foco
         try: await page.click(SEL_SIDEBAR, timeout=2000)
         except: pass
 
-        # Localizar el campo de búsqueda con fallbacks de atajos
         search_box = None
         for sel in SEL_SEARCH:
             try:
@@ -257,11 +225,10 @@ class MacroWhatsApp:
             except: continue
 
         if not search_box:
-            # Fallbacks de atajos como en whatsplay
-            for atajo in ["Control+Alt+/", "Alt+K", "Control+f", "/"]:
+            for shortcut in ["Control+Alt+/", "Alt+K", "Control+f", "/"]:
                 try:
                     await page.keyboard.press("Escape")
-                    await page.keyboard.press(atajo)
+                    await page.keyboard.press(shortcut)
                     await asyncio.sleep(0.5)
                     for sel in SEL_SEARCH:
                         el = page.locator(sel).first
@@ -275,19 +242,17 @@ class MacroWhatsApp:
             try: await search_box.click(force=True)
             except: pass
 
-        # Limpiar y escribir el nombre del chat
         await asyncio.sleep(0.3)
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
         await asyncio.sleep(0.2)
-        await page.keyboard.type(nombre, delay=80)
-        await asyncio.sleep(2.5) # Tiempo para que carguen los resultados
+        await page.keyboard.type(name, delay=80)
+        await asyncio.sleep(2.5) 
 
-        # Intentar hacer clic en el resultado (Varios selectores posibles)
         selectors = [
-            f'span[title="{nombre}"]',
-            f'div[data-testid="list-item"] span[title="{nombre}"]',
-            f'div[role="listitem"] span[title="{nombre}"]'
+            f'span[title="{name}"]',
+            f'div[data-testid="list-item"] span[title="{name}"]',
+            f'div[role="listitem"] span[title="{name}"]'
         ]
         
         found = False
@@ -301,34 +266,26 @@ class MacroWhatsApp:
             except: continue
 
         if not found:
-            logger.warning(f"   [!] No se pudo clicar en '{nombre}', forzando con Enter...")
+            logger.warning(f"   [!] Could not click on '{name}', forcing with Enter...")
             await page.keyboard.press("Enter")
 
         await asyncio.sleep(1.5)
-        return await self._esperar_chat_abierto(nombre)
+        return await self._wait_for_chat_to_open(name)
 
-    async def _esperar_chat_abierto(self, nombre: str) -> bool:
-        """Verifica que el header del chat muestre el nombre correcto."""
+    async def _wait_for_chat_to_open(self, name: str) -> bool:
         try:
             header = self._page.locator(f"{SEL_MAIN} header")
             await header.wait_for(timeout=10000)
-            titulo = header.locator('span[dir="auto"]').first
-            await titulo.wait_for(state="visible", timeout=5000)
-            texto = await titulo.text_content()
-            if texto and nombre.lower() in texto.lower():
-                logger.debug(f"   [✓] Confirmado: Chat '{nombre}' correctamente abierto.")
+            title = header.locator('span[dir="auto"]').first
+            await title.wait_for(state="visible", timeout=5000)
+            text = await title.text_content()
+            if text and name.lower() in text.lower():
                 return True
-            logger.warning(f"   [!] Header muestra '{texto}', esperaba '{nombre}'.")
             return False
         except:
             return False
 
-    # ─────────────────────────────────────────
-    # ENVÍO DE TEXTO
-    # ─────────────────────────────────────────
-
-    async def _obtener_input_texto(self):
-        """Retorna el campo de texto del chat activo."""
+    async def _get_text_input(self):
         for sel in SEL_INPUT_TEXTO:
             try:
                 el = self._page.locator(sel).first
@@ -337,88 +294,69 @@ class MacroWhatsApp:
             except: continue
         return self._page.locator('div[contenteditable="true"]').last
 
-    async def _enviar_texto(self, texto: str):
-        """Escribe y envía un mensaje de texto."""
-        box = await self._obtener_input_texto()
+    async def _send_text(self, text: str):
+        box = await self._get_text_input()
         await box.click()
         await box.fill("")
         await asyncio.sleep(0.2)
-        await self._page.keyboard.insert_text(texto)
+        await self._page.keyboard.insert_text(text)
         await asyncio.sleep(0.3)
         await self._page.keyboard.press("Enter")
 
-    # ─────────────────────────────────────────
-    # ENVÍO DE ARCHIVOS
-    # ─────────────────────────────────────────
-
-    async def _enviar_archivos(self, rutas: list, caption: str = None):
-        """
-        Adjunta archivos usando la mejor estrategia según el modo (Clipboard vs Input).
-        """
-        rutas_validas = [os.path.abspath(r) for r in rutas if os.path.exists(r)]
-        if not rutas_validas:
-            logger.error("   [✗] Ningún archivo válido para adjuntar.")
+    async def _send_files(self, paths: list, caption: str = None):
+        valid_paths = [os.path.abspath(p) for p in paths if os.path.exists(p)]
+        if not valid_paths:
+            logger.error("   [X] No valid files to attach.")
             return
 
         page = self._page
         
-        # ESTRATEGIA A: Portapapeles (Solo en modo VISIBLE)
         if not self.headless:
             try:
-                logger.info(f"   Adjuntando {len(rutas_validas)} archivo(s) vía portapapeles (Modo Visible)...")
-                await self._pegar_archivos_portapapeles(rutas_validas, page)
+                logger.info(f"   Attaching {len(valid_paths)} file(s) via clipboard (Visible Mode)...")
+                await self._paste_files_from_clipboard(valid_paths, page)
                 await asyncio.sleep(4)
-                if caption: await self._escribir_caption(caption, page)
-                await self._click_enviar()
+                if caption: await self._write_caption(caption, page)
+                await self._click_send()
                 return
             except Exception as e:
-                logger.warning(f"   [!] Falló portapapeles: {e}. Intentando método de input...")
+                logger.warning(f"   [!] Clipboard failed: {e}. Trying input method...")
 
-        # ESTRATEGIA B: Carga Directa (File Chooser Profesional)
         try:
-            logger.info(f"   [MODO OCULTO] Usando interceptor de archivos (File Chooser)...")
+            logger.info(f"   [HEADLESS MODE] Using File Chooser interceptor...")
             
-            # 1. Preparar la escucha del selector de archivos
             async with page.expect_file_chooser() as fc_info:
-                # 2. Abrir menú y clicar en Documento para disparar el selector
                 try:
                     await page.locator(SEL_BTN_ADJUNTAR).first.click(timeout=3000)
                     await asyncio.sleep(0.5)
                     
-                    # Intentamos clicar en el icono de documento
                     doc_btn = page.locator('span[data-icon="attach-document"], [aria-label="Documento"]').first
                     await doc_btn.click(timeout=2000)
                 except Exception as e:
-                    logger.warning(f"      [!] No se pudo disparar el menú: {e}")
-                    # Fallback: intentar clicar en cualquier input para forzarlo
+                    logger.warning(f"      [!] Could not trigger menu: {e}")
                     await page.locator('input[type="file"]').first.click()
 
-            # 3. Entregar los archivos al selector interceptado
             file_chooser = await fc_info.value
-            await file_chooser.set_files(rutas_validas)
+            await file_chooser.set_files(valid_paths)
             
-            logger.info("   [✓] Archivos entregados a WhatsApp. Esperando vista previa...")
             await asyncio.sleep(7) 
             
             if caption:
-                await self._escribir_caption(caption, page)
+                await self._write_caption(caption, page)
 
-            # 4. Enviar
-            await self._click_enviar()
-            logger.info("   [✓] Envío completado.")
+            await self._click_send()
 
         except Exception as e:
-            logger.error(f"   [✗] Error crítico al adjuntar: {e}")
+            logger.error(f"   [X] Critical error attaching: {e}")
             try: await page.keyboard.press("Escape")
             except: pass
 
-    async def _pegar_archivos_portapapeles(self, rutas: list, page):
-        """Estrategia de respaldo: copia archivos al portapapeles y pega con Ctrl+V."""
+    async def _paste_files_from_clipboard(self, paths: list, page):
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
             "[System.Windows.Forms.Clipboard]::Clear(); "
             "$f = New-Object System.Collections.Specialized.StringCollection; "
-            + " ".join(f"$f.Add('{r.replace(chr(39), chr(39)*2)}');" for r in rutas)
+            + " ".join(f"$f.Add('{p.replace(chr(39), chr(39)*2)}');" for p in paths)
             + "[System.Windows.Forms.Clipboard]::SetFileDropList($f)"
         )
         subprocess.run(
@@ -426,30 +364,24 @@ class MacroWhatsApp:
             creationflags=0x08000000, timeout=10
         )
         await asyncio.sleep(0.5)
-        input_box = await self._obtener_input_texto()
+        input_box = await self._get_text_input()
         await input_box.click()
         await page.keyboard.press("Control+V")
         await asyncio.sleep(3.5)
 
-    async def _escribir_caption(self, texto: str, page):
-        """Escribe el texto de leyenda en el campo de caption del adjunto."""
+    async def _write_caption(self, text: str, page):
         for sel in SEL_CAPTION:
             try:
                 cap = page.locator(sel).last
                 if await cap.is_visible(timeout=2000):
                     await cap.click()
-                    await page.keyboard.insert_text(texto)
+                    await page.keyboard.insert_text(text)
                     await asyncio.sleep(0.4)
-                    logger.info("   Caption añadido al adjunto.")
                     return
             except: continue
-        logger.warning("   [!] No se encontró el campo de caption.")
 
-    async def _click_enviar(self):
-        """Presiona el botón de Enviar asegurando que clica la vista previa y no el fondo."""
+    async def _click_send(self):
         try:
-            # Esperar a que el botón sea visible (el botón de la vista previa)
-            # Aumentamos el tiempo de espera y usamos más selectores específicos
             selectors = [
                 'div[role="button"] span[data-icon="send"]',
                 'div[role="button"] span[data-icon="wds-ic-send-filled"]',
@@ -463,149 +395,131 @@ class MacroWhatsApp:
             btn_found = False
             for sel in selectors:
                 try:
-                    # Buscamos el último elemento que coincida (el de la vista previa suele ser el último o único visible)
                     btn = self._page.locator(sel).last
                     if await btn.is_visible(timeout=2000):
-                        logger.info(f"   [✓] Botón de envío encontrado: {sel}")
                         await btn.click(force=True)
                         btn_found = True
                         break
                 except: continue
 
             if not btn_found:
-                logger.warning("   [!] No se detectó botón visual. Intentando forzar con Enter...")
                 await self._page.keyboard.press("Enter")
             
         except Exception as e:
-            logger.error(f"   [✗] Error en clic de envío: {e}")
             await self._page.keyboard.press("Enter")
 
-    # ─────────────────────────────────────────
-    # VERIFICACIÓN Y UTILIDADES
-    # ─────────────────────────────────────────
-
-    async def enviar_captura(self, chat: str, html: str, caption: str = None, engine: str = "marco") -> bool:
-        """
-        Genera una imagen desde HTML, BUSCA EL CHAT, la envía y luego la elimina.
-        """
-        if engine == "marco":
-            from Scripts.Util.PictureMarco import picture as EngineClass
-        else:
-            from Scripts.Util.Picture import Picture as EngineClass
-        
+    async def send_capture(self, chat: str, html: str, caption: str = None) -> bool:
+        from Scripts.Util.PictureMarco import picture as EngineClass
         from Scripts.Util.Storage import Storage
         
         p = EngineClass()
         s = Storage("imagenes")
         
         try:
-            # 1. Asegurar conexión y buscar el chat
-            if not await self.conectar():
+            if not await self.connect():
                 return False
             
-            if not await self._buscar_chat(chat):
-                logger.error(f"   [✗] No se pudo encontrar el chat para la captura: {chat}")
+            if not await self._search_chat(chat):
                 return False
 
-            # 2. Generar la imagen
-            logger.info(f"   [Captura] Generando imagen ({engine}) para {chat}...")
-            ruta_imagen = await p.crear_imagen(html)
+            img_path = await p.create_image(html)
+            success = await self._send_multimedia([img_path], caption)
             
-            # 3. Enviar usando el canal de MULTIMEDIA (visible)
-            exito = await self._enviar_multimedia([ruta_imagen], caption)
+            if success:
+                s.delete_file(img_path)
             
-            if exito:
-                s.borrar_archivo(ruta_imagen)
-            
-            return exito
+            return success
         except Exception as e:
-            logger.error(f"   [✗] Error en proceso de captura: {e}")
             return False
 
-    async def _verificar_envio(self) -> bool:
-        """
-        Espera a que desaparezca el icono de 'pendiente' y aparezca
-        el de 'enviado' o 'entregado'. Timeout de 15 segundos.
-        """
+    async def _verify_send(self) -> bool:
         await asyncio.sleep(1.5)
         try:
-            # Esperar a que el mensaje deje de estar "pendiente"
             await self._page.locator(SEL_MSG_PENDIENTE).last.wait_for(
                 state="hidden", timeout=15000
             )
             return True
         except:
-            # Si el timeout vence, lo consideramos enviado de todas formas
-            # (WhatsApp puede no mostrar el tick si hay lag)
             return True
 
-    async def _enviar_multimedia(self, rutas: list, caption: str = None) -> bool:
-        """
-        Envía archivos usando el canal de 'Fotos y Videos' (o Pegar) para que sean visibles como imágenes.
-        """
+    async def _send_multimedia(self, paths: list, caption: str = None) -> bool:
         page = self._page
-        rutas_validas = [os.path.abspath(r) for r in rutas if os.path.exists(r)]
-        if not rutas_validas:
-            logger.error("   [✗] No hay rutas válidas para enviar multimedia.")
+        valid_paths = [os.path.abspath(p) for p in paths if os.path.exists(p)]
+        if not valid_paths:
             return False
         
         try:
-            # ESTRATEGIA A: Portapapeles (Solo en modo VISIBLE)
-            # El pegado directo suele forzar a WhatsApp a tratarlo como imagen/video con vista previa
             if not self.headless:
                 try:
-                    logger.info(f"   [Multimedia] Pegando {len(rutas_validas)} imagen(es) vía portapapeles...")
-                    await self._pegar_archivos_portapapeles(rutas_validas, page)
-                    
-                    # Esperar a que cargue la vista previa
-                    logger.info("   [Multimedia] Esperando procesamiento de vista previa...")
+                    logger.info(f"   [Multimedia] Pasting {len(valid_paths)} image(s) via clipboard...")
+                    await self._paste_files_from_clipboard(valid_paths, page)
                     await asyncio.sleep(5) 
                     
                     if caption: 
-                        await self._escribir_caption(caption, page)
+                        await self._write_caption(caption, page)
                         await asyncio.sleep(0.5)
                     
-                    await self._click_enviar()
+                    await self._click_send()
                     return True
                 except Exception as e:
-                    logger.warning(f"   [!] Falló pegado en multimedia: {e}. Intentando método de selector...")
+                    logger.warning(f"   [!] Multimedia paste failed: {e}. Trying selector method...")
 
-            # ESTRATEGIA B: Método de selector (Fotos y Videos)
-            logger.info("   [Multimedia] Usando selector de 'Fotos y videos'...")
-            async with page.expect_file_chooser() as fc_info:
-                # 1. Clic en el clip/plus
-                await page.locator(SEL_BTN_ADJUNTAR).first.click(timeout=3000)
-                await asyncio.sleep(0.5)
+            logger.info("   [Multimedia] Using 'Photos & Videos' selector...")
+            
+            try:
+                btn_adjuntar = page.locator(SEL_BTN_ADJUNTAR).first
+                await btn_adjuntar.wait_for(state="visible", timeout=5000)
+                await btn_adjuntar.click(force=True)
+                await asyncio.sleep(0.8) 
+            except Exception as e:
+                raise e
+
+            try:
+                async with page.expect_file_chooser(timeout=10000) as fc_info:
+                    btn_fotos_selectors = [
+                        'span[data-icon="attach-image"]',
+                        '[aria-label="Fotos y videos"]',
+                        '[aria-label="Photos & Videos"]',
+                        'li:has(span[data-icon="attach-image"])',
+                        'button:has(span[data-icon="attach-image"])'
+                    ]
+                    
+                    btn_fotos = None
+                    for sel_f in btn_fotos_selectors:
+                        try:
+                            el = page.locator(sel_f).first
+                            if await el.is_visible(timeout=500):
+                                btn_fotos = el
+                                break
+                        except: continue
+                    
+                    if not btn_fotos:
+                        btn_fotos = page.get_by_role("button").filter(has_text="Fotos y videos")
+                    
+                    await btn_fotos.click(force=True)
                 
-                # 2. Clic en "Fotos y videos"
-                btn_fotos = page.locator('span[data-icon="attach-image"], [aria-label="Fotos y videos"]').first
-                await btn_fotos.click()
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(valid_paths)
+            except Exception as e:
+                await page.keyboard.press("Escape")
+                return False
             
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(rutas_validas)
-            
-            # 3. Esperar procesamiento
-            logger.info("   [Multimedia] Esperando a que la imagen esté lista...")
             await asyncio.sleep(5)
             
             if caption: 
-                await self._escribir_caption(caption, page)
+                await self._write_caption(caption, page)
                 await asyncio.sleep(0.5)
 
-            # 4. Enviar
-            await self._click_enviar()
+            await self._click_send()
             return True
 
         except Exception as e:
-            logger.error(f"   [✗] Error al enviar multimedia: {e}")
             return False
 
-    async def cerrar(self):
-        """Cierra la conexión Playwright sin cerrar el navegador."""
-        await self._limpiar_conexion()
+    async def close(self):
+        await self._clean_connection()
 
-    async def _pagina_activa(self) -> bool:
-        """Retorna True si la página de WhatsApp está abierta y activa."""
+    async def _is_page_active(self) -> bool:
         try:
             return bool(self._page and not self._page.is_closed())
         except:

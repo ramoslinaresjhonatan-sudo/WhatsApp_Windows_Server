@@ -1,159 +1,124 @@
 import os
 import sys
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, Request
+import logging
+import psutil
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(BASE_DIR)
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
 load_dotenv(os.path.join(BASE_DIR, '.env'))
 
+from Scripts.Util.Logger import setup_logger
 from Scripts.Util.MacroWhatsApp import MacroWhatsApp
 from Scripts.Util.Security import SecurityManager
-from Scripts.Util.Logger import setup_logger
-from Config.Setting import configure_settings, limiter
 
-logger = setup_logger("API", os.path.join(BASE_DIR, 'logs', 'api.log'))
-app = FastAPI(title="WhatsApp Automation API")
-configure_settings(app)
-
+logger = setup_logger("API-Bridge", "api.log")
 ws = MacroWhatsApp()
-security = SecurityManager(whatsapp_service=ws)
-
-mensaje_queue = asyncio.Queue()
-
-async def monitorear_memoria_background():
-    while True:
-        try:
-            await ws.verificar_y_limpiar_ram()
-        except Exception as e:
-            logger.error(f"Error en monitor de memoria: {e}")
-        await asyncio.sleep(120)
-
-async def procesador_de_cola():
-    logger.info("Procesador de cola de mensajes iniciado.")
-    while True:
-        chat, mensaje, archivos, future = await mensaje_queue.get()
-        try:
-            logger.info(f"Procesando mensaje en cola para: {chat}")
-            
-            if isinstance(archivos, dict) and archivos.get("tipo") == "captura_html":
-                # Nueva lógica para capturar HTML y enviar
-                resultado = await ws.enviar_captura(chat, mensaje)
-            elif archivos:
-                resultado = await ws.varios(chat, archivos, mensaje)
-            else:
-                resultado = await ws.mensaje(chat, mensaje)
-            
-            if not future.done():
-                future.set_result(resultado)
-            
-            await asyncio.sleep(2.5) 
-            
-        except Exception as e:
-            logger.error(f"Error en el worker de cola: {e}")
-            if not future.done():
-                future.set_exception(e)
-        finally:
-            mensaje_queue.task_done()
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(monitorear_memoria_background())
-    asyncio.create_task(procesador_de_cola())
-    logger.info("Servicios de segundo plano iniciados.")
+security = SecurityManager(ws)
 
 class MessageRequest(BaseModel):
     chat: str
-    mensaje: str
-    archivos: Optional[List[str]] = None
+    message: Optional[str] = None
+    files: Optional[List[str]] = None
 
-@app.post("/enviar-mensaje", dependencies=[Depends(security.verificar)])
-async def api_enviar_mensaje(req: MessageRequest, request: Request):
-    logger.info(f"Petición recibida de {request.client.host}. Encolando mensaje para '{req.chat}'")
-    
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    
-    await mensaje_queue.put((req.chat, req.mensaje, req.archivos, future))
-    
-    try:
-        resultado = await asyncio.wait_for(future, timeout=300)
-        
-        if resultado:
-            return {
-                "status": "success", 
-                "destinatario": req.chat,
-                "info": "Mensaje procesado desde la cola",
-                "cola_restante": mensaje_queue.qsize()
-            }
-        
-        raise HTTPException(status_code=500, detail="El robot no pudo completar el envío del mensaje")
-        
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout en cola para el chat: {req.chat}")
-        raise HTTPException(status_code=504, detail="Tiempo de espera en cola agotado")
-    except Exception as e:
-        logger.error(f"Error procesando envío encolado: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+class CaptureRequest(BaseModel):
+    chat: str
+    html: str
+    caption: Optional[str] = None
 
-@app.post("/enviar-captura", dependencies=[Depends(security.verificar)])
-async def api_enviar_captura(req: MessageRequest, request: Request):
-    """
-    Nuevo endpoint: Recibe HTML en el campo 'mensaje' y lo envía como imagen.
-    """
-    logger.info(f"Petición de CAPTURA recibida de {request.client.host} para '{req.chat}'")
-    
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    
-    # Usamos un marcador especial en la cola para identificar que es una captura
-    await mensaje_queue.put((req.chat, req.mensaje, {"tipo": "captura_html"}, future))
-    
-    try:
-        resultado = await asyncio.wait_for(future, timeout=300)
-        if resultado: return {"status": "success", "info": "HTML enviado como imagen"}
-        raise HTTPException(status_code=500, detail="Error al procesar captura HTML")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    import psutil
-    
-    api_proc = psutil.Process(os.getpid())
-    api_ram = api_proc.memory_info().rss / (1024 * 1024)
-    
-    edge_ram = 0
-    puerto_config = os.getenv("PUERTO_WHATSAPP", "9222")
-    pids_automatizacion = set()
-    
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        if 'msedge' in proc.info['name'].lower():
-            try:
-                cmdline = proc.info.get('cmdline') or []
-                if any(f"--remote-debugging-port={puerto_config}" in arg for arg in cmdline):
-                    pids_automatizacion.add(proc.info['pid'])
-                    p = psutil.Process(proc.info['pid'])
-                    for child in p.children(recursive=True):
-                        pids_automatizacion.add(child.pid)
-            except: continue
+message_queue = asyncio.Queue()
 
-    for pid in pids_automatizacion:
+async def monitor_memory_background():
+    while True:
         try:
-            p = psutil.Process(pid)
-            edge_ram += p.memory_info().rss / (1024 * 1024)
-        except: continue
-            
-    return {
-        "navegador_conectado": await ws._pagina_activa(),
-        "api_ram_mb": round(api_ram, 2),
-        "edge_ram_total_mb": round(edge_ram, 2),
-        "tareas_activas": ws._tareas_activas,
-        "limite_ram_configurado": ws.limite_ram
-    }
+            await ws.check_and_clean_ram()
+        except: pass
+        await asyncio.sleep(120)
+
+async def queue_processor():
+    logger.info("   Queue processor started. Ready for messages.")
+    while True:
+        chat, msg, files, future = await message_queue.get()
+        try:
+            logger.info(f"Processing queued message for: {chat}")
+            success = await ws.send(chat, msg, files)
+            future.set_result(success)
+        except Exception as e:
+            logger.error(f"Error processing queue: {e}")
+            future.set_result(False)
+        finally:
+            message_queue.task_done()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(monitor_memory_background())
+    asyncio.create_task(queue_processor())
+    yield
+    await ws.close()
+
+app = FastAPI(title="WhatsApp API Bridge", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/send-message")
+async def api_send_message(req: MessageRequest, request: Request):
+    await security.verify(request)
+    
+    if not req.message and not req.files:
+        raise HTTPException(status_code=400, detail="Must provide message or files")
+
+    logger.info(f"Request received from {request.client.host}. Queuing message for '{req.chat}'")
+    
+    future = asyncio.get_event_loop().create_future()
+    await message_queue.put((req.chat, req.message, req.files, future))
+    
+    success = await future
+    if success:
+        return {"status": "success", "destination": req.chat}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send message")
+
+@app.post("/send-capture")
+async def api_send_capture(req: CaptureRequest, request: Request):
+    await security.verify(request)
+    
+    logger.info(f"Capture request for '{req.chat}'")
+    success = await ws.send_capture(req.chat, req.html, req.caption)
+    
+    if success:
+        return {"status": "success", "destination": req.chat}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send capture")
+
+@app.get("/system")
+async def api_system(request: Request):
+    try:
+        proc = psutil.Process(os.getpid())
+        api_ram = proc.memory_info().rss / (1024 * 1024)
+        
+        return {
+            "browser_connected": await ws.connect(),
+            "api_ram_mb": round(api_ram, 2),
+            "active_tasks": ws._active_tasks,
+            "ram_limit_mb": ws.ram_limit
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
-    puerto = int(os.getenv("PUERTO_API", "8000"))
-    logger.info(f"Iniciando API en el puerto {puerto}...")
-    uvicorn.run(app, host="0.0.0.0", port=puerto)
+    port = int(os.getenv("PUERTO_API", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
