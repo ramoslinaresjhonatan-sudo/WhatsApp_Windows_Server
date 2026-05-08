@@ -3,6 +3,7 @@ venv/*
 .log*
 Config/Setting.py
 Storage/*
+!Storage/.kitigt
 Documentacion/*
 Logs/*
 !Logs/.kitigt
