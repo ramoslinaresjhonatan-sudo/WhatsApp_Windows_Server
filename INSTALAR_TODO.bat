@@ -36,6 +36,14 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-echo    INSTALACION COMPLETADA EXITOSAMENTE
+
+echo    PREPARANDO SESION DE WHATSAPP
+echo [+] Abriendo navegador para escanear QR...
+echo [!] IMPORTANTE: Escanea el QR y espera a que carguen tus chats.
+echo [!] Una vez cargados, cierra el navegador para finalizar el setup.
+echo.
+python Scripts\Util\Login.py
+echo ==========================================
 echo Ya puedes ejecutar INICIAR_TODO.bat
+echo.
 pause
